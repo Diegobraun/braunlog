@@ -3,6 +3,7 @@ package com.braunlog;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Optional;
@@ -53,7 +54,14 @@ final class Segmento implements AutoCloseable {
   static Segmento abrir(
       Path diretorio, long offsetBase, ConfiguracaoLog configuracao, boolean ultimoDoLog)
       throws IOException {
-    Path arquivo = diretorio.resolve(nomeDeArquivo(offsetBase));
+    return abrirEm(diretorio.resolve(nomeDeArquivo(offsetBase)), offsetBase, configuracao,
+        ultimoDoLog);
+  }
+
+  /** Abre um segmento num arquivo de nome arbitrario, como o temporario da compactacao. */
+  static Segmento abrirEm(
+      Path arquivo, long offsetBase, ConfiguracaoLog configuracao, boolean ultimoDoLog)
+      throws IOException {
     FileChannel canal =
         FileChannel.open(
             arquivo, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
@@ -98,9 +106,16 @@ final class Segmento implements AutoCloseable {
   }
 
   Offset anexar(Registro registro, long timestamp) throws IOException {
+    return anexarComOffset(registro, proximoOffsetRelativo, timestamp);
+  }
+
+  /**
+   * Escreve preservando o offset original do registro. E o que permite a compactacao reescrever um
+   * segmento sem renumerar nada — o preco e que o segmento compactado passa a ter lacunas.
+   */
+  Offset anexarComOffset(Registro registro, int offsetRelativo, long timestamp) throws IOException {
     int tamanho = FormatoRegistro.tamanhoCodificado(registro);
     int posicao = (int) limiteLegivel;
-    int offsetRelativo = proximoOffsetRelativo;
 
     ByteBuffer buffer = ByteBuffer.allocate(tamanho);
     FormatoRegistro.codificar(buffer, registro, offsetRelativo, timestamp);
@@ -161,6 +176,17 @@ final class Segmento implements AutoCloseable {
 
   void sincronizar() throws IOException {
     canal.force(true);
+  }
+
+  /** Fecha e remove o arquivo de segmento e o indice que o acompanha. */
+  void apagar() throws IOException {
+    close();
+    Files.deleteIfExists(arquivo);
+    Files.deleteIfExists(arquivoDeIndice(arquivo));
+  }
+
+  void apagarIndice() throws IOException {
+    Files.deleteIfExists(arquivoDeIndice(arquivo));
   }
 
   @Override

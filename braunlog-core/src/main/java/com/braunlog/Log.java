@@ -1,6 +1,7 @@
 package com.braunlog;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,6 +11,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -113,6 +115,64 @@ public final class Log implements AutoCloseable {
     return segmentos.size();
   }
 
+  public long bytes() {
+    return segmentos.stream().mapToLong(Segmento::bytes).sum();
+  }
+
+  /**
+   * Apaga segmentos fechados enquanto a politica de retencao mandar. Roda sozinha na abertura e a
+   * cada rolagem; nao ha thread de background, entao um log parado nunca encolhe sozinho.
+   */
+  public synchronized void aplicarRetencao() {
+    try {
+      long agora = Math.max(configuracao.relogio().millis(), ultimoTimestamp);
+      while (segmentos.size() > 1) {
+        Segmento candidato = segmentos.getFirst();
+        if (!configuracao.politicaRetencao()
+            .deveDescartar(bytes(), candidato.ultimoTimestamp(), agora)) {
+          return;
+        }
+        segmentos.remove(candidato);
+        candidato.apagar();
+        sincronizarDiretorioSeNecessario();
+      }
+    } catch (IOException e) {
+      throw new ErroDeLog("falha ao aplicar retencao em " + diretorio, e);
+    }
+  }
+
+  /**
+   * Reescreve os segmentos fechados cujo dirty ratio passou do minimo configurado, mantendo apenas
+   * o ultimo registro de cada chave. O segmento ativo nunca e tocado.
+   */
+  public synchronized RelatorioDeCompactacao compactar() {
+    List<Segmento> fechados = List.copyOf(segmentos.subList(0, segmentos.size() - 1));
+    if (fechados.isEmpty()) {
+      return RelatorioDeCompactacao.NADA_A_FAZER;
+    }
+    try {
+      Map<ByteBuffer, Long> ultimos = Compactador.ultimoOffsetPorChave(fechados);
+      int reescritos = 0;
+      long bytesAntes = 0;
+      long bytesDepois = 0;
+      for (Segmento antigo : fechados) {
+        if (Compactador.dirtyRatio(antigo, ultimos) < configuracao.dirtyRatioMinimo()) {
+          continue;
+        }
+        bytesAntes += antigo.bytes();
+        Segmento novo = Compactador.reescrever(antigo, ultimos, configuracao);
+        segmentos.set(segmentos.indexOf(antigo), novo);
+        antigo.close();
+        bytesDepois += novo.bytes();
+        reescritos++;
+      }
+      sincronizarDiretorioSeNecessario();
+      return new RelatorioDeCompactacao(reescritos, bytesAntes, bytesDepois);
+    } catch (IOException e) {
+      throw new ErroDeLog("falha ao compactar " + diretorio, e);
+    }
+  }
+
   public synchronized void forcarSincronizacao() {
     try {
       sincronizar();
@@ -162,10 +222,21 @@ public final class Log implements AutoCloseable {
     return retrato.get(escolhido);
   }
 
+  /**
+   * Busca pelo offset base, e nao por identidade: o objeto do segmento pode ter sido trocado por um
+   * compactado enquanto um leitor ainda segurava o antigo.
+   */
   Optional<Segmento> segmentoApos(Segmento segmento) {
-    List<Segmento> retrato = segmentos;
-    int posicao = retrato.indexOf(segmento) + 1;
-    return posicao < retrato.size() ? Optional.of(retrato.get(posicao)) : Optional.empty();
+    for (Segmento candidato : segmentos) {
+      if (candidato.offsetBase() > segmento.offsetBase()) {
+        return Optional.of(candidato);
+      }
+    }
+    return Optional.empty();
+  }
+
+  boolean contem(Segmento segmento) {
+    return segmentos.contains(segmento);
   }
 
   private long primeiroOffsetDoLog() {
@@ -180,6 +251,7 @@ public final class Log implements AutoCloseable {
       ultimoTimestamp = Math.max(ultimoTimestamp, segmento.ultimoTimestamp());
     }
     ativo = segmentos.getLast();
+    aplicarRetencao();
   }
 
   private void rolar() throws IOException {
@@ -189,6 +261,13 @@ public final class Log implements AutoCloseable {
     ativo = novo;
     if (!(configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum)) {
       anterior.sincronizar();
+      sincronizarDiretorio();
+    }
+    aplicarRetencao();
+  }
+
+  private void sincronizarDiretorioSeNecessario() {
+    if (!(configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum)) {
       sincronizarDiretorio();
     }
   }

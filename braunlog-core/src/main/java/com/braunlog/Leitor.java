@@ -1,6 +1,7 @@
 package com.braunlog;
 
 import java.io.IOException;
+import java.nio.channels.ClosedChannelException;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.Optional;
@@ -14,6 +15,10 @@ import com.braunlog.formato.ResultadoDecodificacao;
  * depois de um registro inteiro ter sido escrito. E isso, e nao um lock, que impede um leitor de ver
  * meio registro. Um leitor que chegou ao fim do segmento ativo enxerga a rolagem na chamada
  * seguinte, entao da para acompanhar o writer sem reabrir o log.
+ *
+ * <p>Compactacao e retencao trocam ou apagam segmentos embaixo de leitores em andamento. Quando isso
+ * acontece, a leitura do canal fechado falha e o leitor se reposiciona pelo proximo offset que
+ * esperava — continua de onde parava, no arquivo que estiver valendo agora.
  */
 public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
 
@@ -22,6 +27,7 @@ public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
 
   private Segmento segmento;
   private long posicao;
+  private long proximoOffsetEsperado;
   private RegistroLido pendente;
   private boolean fechado;
 
@@ -30,6 +36,7 @@ public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
     this.offsetMinimo = offsetMinimo;
     this.segmento = segmento;
     this.posicao = posicao;
+    this.proximoOffsetEsperado = offsetMinimo.valor();
   }
 
   static Leitor abrir(Log log, Offset offsetMinimo) {
@@ -64,34 +71,62 @@ public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
     if (fechado) {
       throw new ErroDeLog("leitor ja fechado");
     }
-    try {
-      while (true) {
-        switch (segmento.ler(posicao)) {
-          case ResultadoDecodificacao.Sucesso sucesso -> {
-            posicao += sucesso.bytesConsumidos();
-            if (sucesso.registro().offset().compareTo(offsetMinimo) >= 0) {
-              return sucesso.registro();
-            }
-          }
-          case ResultadoDecodificacao.Corrompido corrompido ->
-              throw new ErroDeCorrupcao(
-                  "registro corrompido em " + segmento.arquivo() + " na posicao " + posicao + ": "
-                      + corrompido.motivo());
-          case ResultadoDecodificacao.Parcial ignorado -> {
-            return null;
-          }
-          case ResultadoDecodificacao.Fim ignorado -> {
-            Optional<Segmento> proximo = log.segmentoApos(segmento);
-            if (proximo.isEmpty()) {
-              return null;
-            }
-            segmento = proximo.get();
-            posicao = 0;
+    while (true) {
+      try {
+        return varrer();
+      } catch (ClosedChannelException segmentoTrocadoOuApagado) {
+        if (!reposicionar()) {
+          throw new ErroDeLog(
+              "segmento " + segmento.arquivo() + " foi fechado enquanto o leitor o usava",
+              segmentoTrocadoOuApagado);
+        }
+      } catch (IOException e) {
+        throw new ErroDeLog("falha ao ler " + segmento.arquivo() + " na posicao " + posicao, e);
+      }
+    }
+  }
+
+  private RegistroLido varrer() throws IOException {
+    while (true) {
+      switch (segmento.ler(posicao)) {
+        case ResultadoDecodificacao.Sucesso sucesso -> {
+          posicao += sucesso.bytesConsumidos();
+          RegistroLido lido = sucesso.registro();
+          if (lido.offset().compareTo(offsetMinimo) >= 0) {
+            proximoOffsetEsperado = lido.offset().valor() + 1;
+            return lido;
           }
         }
+        case ResultadoDecodificacao.Corrompido corrompido ->
+            throw new ErroDeCorrupcao(
+                "registro corrompido em " + segmento.arquivo() + " na posicao " + posicao + ": "
+                    + corrompido.motivo());
+        case ResultadoDecodificacao.Parcial ignorado -> {
+          return null;
+        }
+        case ResultadoDecodificacao.Fim ignorado -> {
+          Optional<Segmento> proximo = log.segmentoApos(segmento);
+          if (proximo.isEmpty()) {
+            return null;
+          }
+          segmento = proximo.get();
+          posicao = 0;
+        }
       }
-    } catch (IOException e) {
-      throw new ErroDeLog("falha ao ler " + segmento.arquivo() + " na posicao " + posicao, e);
     }
+  }
+
+  /**
+   * Reaponta para o segmento que hoje contem o offset esperado. Devolve falso quando o segmento
+   * continua sendo o mesmo — ai o canal fechado nao foi troca de arquivo, foi o log fechando.
+   */
+  private boolean reposicionar() {
+    Segmento atual = log.segmentoQueContem(proximoOffsetEsperado);
+    if (atual == segmento) {
+      return false;
+    }
+    segmento = atual;
+    posicao = atual.posicaoParaOffset(proximoOffsetEsperado);
+    return true;
   }
 }
