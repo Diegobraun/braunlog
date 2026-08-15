@@ -29,7 +29,7 @@ class IndiceEsparsoTest {
   @Test
   void indiceVazioDeveDevolverOInicioDoSegmentoComoPontoDePartida() throws IOException {
     try (IndiceEsparso indice = abrir()) {
-      assertThat(indice.vazio()).isTrue();
+      assertThat(indice.quantidadeDeEntradas()).isZero();
       assertThat(indice.pisoPorOffset(500)).isEqualTo(EntradaDeIndice.INICIO);
       assertThat(indice.pisoPorTimestamp(500).posicao()).isZero();
     }
@@ -112,7 +112,6 @@ class IndiceEsparsoTest {
     try (IndiceEsparso indice = IndiceEsparso.abrir(arquivo, INTERVALO, INTERVALO)) {
 
       // then
-      assertThat(indice.vazio()).isFalse();
       assertThat(indice.quantidadeDeEntradas()).isEqualTo(1);
     }
   }
@@ -181,7 +180,7 @@ class IndiceEsparsoTest {
     // given
     escreverEntradasCruas(new EntradaDeIndice(-1, 0, 1000));
     try (IndiceEsparso indice = abrir()) {
-      assertThat(indice.vazio()).isTrue();
+      assertThat(indice.quantidadeDeEntradas()).isZero();
     }
 
     // when
@@ -189,7 +188,7 @@ class IndiceEsparsoTest {
 
     // then
     try (IndiceEsparso indice = abrir()) {
-      assertThat(indice.vazio()).isTrue();
+      assertThat(indice.quantidadeDeEntradas()).isZero();
     }
   }
 

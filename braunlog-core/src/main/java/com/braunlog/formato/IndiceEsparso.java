@@ -46,10 +46,6 @@ public final class IndiceEsparso implements AutoCloseable {
     return indice;
   }
 
-  public boolean vazio() {
-    return entradas.isEmpty();
-  }
-
   public int quantidadeDeEntradas() {
     return entradas.size();
   }

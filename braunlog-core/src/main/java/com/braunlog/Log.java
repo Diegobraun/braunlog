@@ -235,10 +235,6 @@ public final class Log implements AutoCloseable {
     return Optional.empty();
   }
 
-  boolean contem(Segmento segmento) {
-    return segmentos.contains(segmento);
-  }
-
   private long primeiroOffsetDoLog() {
     return segmentos.getFirst().offsetBase();
   }
@@ -261,16 +257,11 @@ public final class Log implements AutoCloseable {
     ativo = novo;
     if (!(configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum)) {
       anterior.sincronizar();
-      sincronizarDiretorio();
+      sincronizarDiretorioSeNecessario();
     }
     aplicarRetencao();
   }
 
-  private void sincronizarDiretorioSeNecessario() {
-    if (!(configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum)) {
-      sincronizarDiretorio();
-    }
-  }
 
   private void sincronizarConformeOModo(long agora) throws IOException {
     switch (configuracao.modoDurabilidade()) {
@@ -298,7 +289,10 @@ public final class Log implements AutoCloseable {
    * arquivos deixa abrir um diretorio como canal, e onde nao deixa a entrada ja e gravada de outra
    * forma — por isso a falha aqui nao derruba o append.
    */
-  private void sincronizarDiretorio() {
+  private void sincronizarDiretorioSeNecessario() {
+    if (configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum) {
+      return;
+    }
     try (FileChannel canal = FileChannel.open(diretorio, StandardOpenOption.READ)) {
       canal.force(true);
     } catch (IOException naoSuportadoNestaPlataforma) {
