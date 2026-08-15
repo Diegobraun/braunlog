@@ -77,7 +77,10 @@ class TiposDeDominioTest {
   void configuracaoDeveRecusarValoresIncoerentes() {
     ConfiguracaoLog padrao = ConfiguracaoLog.padrao(relogioFixo());
 
-    assertThatThrownBy(() -> new ConfiguracaoLog(null, 1024, 1 << 20, 4096))
+    assertThatThrownBy(
+            () -> new ConfiguracaoLog(null, 1024, 1 << 20, 4096, ModoDurabilidade.NENHUM))
+        .isInstanceOf(NullPointerException.class);
+    assertThatThrownBy(() -> padrao.comModoDurabilidade(null))
         .isInstanceOf(NullPointerException.class);
     assertThatThrownBy(() -> padrao.comTamanhoMaximoRegistro(4))
         .isInstanceOf(IllegalArgumentException.class)
@@ -100,6 +103,9 @@ class TiposDeDominioTest {
         .isEqualTo(ConfiguracaoLog.BYTES_MAXIMOS_POR_SEGMENTO_PADRAO);
     assertThat(padrao.intervaloDoIndiceEmBytes())
         .isEqualTo(ConfiguracaoLog.INTERVALO_DO_INDICE_EM_BYTES_PADRAO);
+    assertThat(padrao.modoDurabilidade()).isEqualTo(ConfiguracaoLog.MODO_DURABILIDADE_PADRAO);
+    assertThat(padrao.comModoDurabilidade(ModoDurabilidade.A_CADA_APPEND).modoDurabilidade())
+        .isEqualTo(new ModoDurabilidade.ACadaAppend());
     assertThat(padrao.comTamanhoMaximoRegistro(512).tamanhoMaximoRegistro()).isEqualTo(512);
     assertThat(padrao.comTamanhoMaximoRegistro(512).comBytesMaximosPorSegmento(4096)
             .bytesMaximosPorSegmento())

@@ -1,8 +1,11 @@
 package com.braunlog;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -28,6 +31,8 @@ public final class Log implements AutoCloseable {
 
   private volatile Segmento ativo;
   private long ultimoTimestamp;
+  private long instanteDaUltimaSincronizacao;
+  private long sincronizacoes;
 
   private Log(Path diretorio, ConfiguracaoLog configuracao) {
     this.diretorio = diretorio;
@@ -62,6 +67,7 @@ public final class Log implements AutoCloseable {
       long timestamp = Math.max(configuracao.relogio().millis(), ultimoTimestamp);
       Offset offset = ativo.anexar(registro, timestamp);
       ultimoTimestamp = timestamp;
+      sincronizarConformeOModo(timestamp);
       return offset;
     } catch (IOException e) {
       throw new ErroDeLog("falha ao anexar em " + diretorio, e);
@@ -107,17 +113,30 @@ public final class Log implements AutoCloseable {
     return segmentos.size();
   }
 
-  public void forcarSincronizacao() {
+  public synchronized void forcarSincronizacao() {
     try {
-      ativo.sincronizar();
+      sincronizar();
     } catch (IOException e) {
       throw new ErroDeLog("falha no fsync de " + diretorio, e);
     }
   }
 
+  /** Quantos {@code fsync} este log ja pediu ao sistema operacional desde que foi aberto. */
+  public synchronized long quantidadeDeSincronizacoes() {
+    return sincronizacoes;
+  }
+
+  /**
+   * Fecha o log sincronizando antes, exceto no modo {@link ModoDurabilidade.Nenhum}: quem escolheu
+   * esse modo pediu que o braunlog nunca chamasse {@code fsync}, e fechar nao e motivo para
+   * desobedecer.
+   */
   @Override
-  public void close() {
+  public synchronized void close() {
     try {
+      if (!(configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum)) {
+        sincronizar();
+      }
       for (Segmento segmento : segmentos) {
         segmento.close();
       }
@@ -164,9 +183,48 @@ public final class Log implements AutoCloseable {
   }
 
   private void rolar() throws IOException {
-    Segmento novo = Segmento.abrir(diretorio, ativo.proximoOffset(), configuracao, true);
+    Segmento anterior = ativo;
+    Segmento novo = Segmento.abrir(diretorio, anterior.proximoOffset(), configuracao, true);
     segmentos.add(novo);
     ativo = novo;
+    if (!(configuracao.modoDurabilidade() instanceof ModoDurabilidade.Nenhum)) {
+      anterior.sincronizar();
+      sincronizarDiretorio();
+    }
+  }
+
+  private void sincronizarConformeOModo(long agora) throws IOException {
+    switch (configuracao.modoDurabilidade()) {
+      case ModoDurabilidade.ACadaAppend ignorado -> sincronizar();
+      case ModoDurabilidade.PorIntervalo(Duration intervalo) -> {
+        if (agora - instanteDaUltimaSincronizacao >= intervalo.toMillis()) {
+          sincronizar();
+        }
+      }
+      case ModoDurabilidade.Nenhum ignorado -> {
+        // o contrato deste modo e justamente nao chamar fsync
+      }
+    }
+  }
+
+  private void sincronizar() throws IOException {
+    ativo.sincronizar();
+    instanteDaUltimaSincronizacao = ultimoTimestamp;
+    sincronizacoes++;
+  }
+
+  /**
+   * Sincronizar o arquivo novo nao basta: a entrada dele no diretorio e outro bloco de metadados, e
+   * sem este fsync um segmento recem-criado pode sumir numa queda de energia. Nem todo sistema de
+   * arquivos deixa abrir um diretorio como canal, e onde nao deixa a entrada ja e gravada de outra
+   * forma — por isso a falha aqui nao derruba o append.
+   */
+  private void sincronizarDiretorio() {
+    try (FileChannel canal = FileChannel.open(diretorio, StandardOpenOption.READ)) {
+      canal.force(true);
+    } catch (IOException naoSuportadoNestaPlataforma) {
+      // ver o javadoc: nao ha o que fazer, e falhar seria pior
+    }
   }
 
   /** Arquivos com nome fora da convencao sao ignorados: o diretorio pode ser de outra pessoa. */
