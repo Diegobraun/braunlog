@@ -78,7 +78,8 @@ class TiposDeDominioTest {
     ConfiguracaoLog padrao = ConfiguracaoLog.padrao(relogioFixo());
 
     assertThatThrownBy(
-            () -> new ConfiguracaoLog(null, 1024, 1 << 20, 4096, ModoDurabilidade.NENHUM))
+            () -> new ConfiguracaoLog(null, 1024, 1 << 20, 4096, ModoDurabilidade.NENHUM,
+                    PoliticaRetencao.NENHUMA, 0.5))
         .isInstanceOf(NullPointerException.class);
     assertThatThrownBy(() -> padrao.comModoDurabilidade(null))
         .isInstanceOf(NullPointerException.class);
