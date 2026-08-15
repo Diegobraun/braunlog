@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verificar:
+    name: testes e gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: instalar jdk 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: build completo com cobertura e mutacao
+        run: ./mvnw -B --no-transfer-progress clean verify
+
+      - name: guardar relatorios
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios
+          path: |
+            braunlog-core/target/site/jacoco/
+            braunlog-core/target/pit-reports/
+          retention-days: 7
+
+  compilar-benchmark:
+    name: benchmark compila e roda um smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: instalar jdk 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: empacotar
+        run: ./mvnw -B --no-transfer-progress -DskipTests package
+
+      - name: uma iteracao curta so para garantir que a suite roda
+        run: >
+          java -jar braunlog-benchmark/target/benchmarks.jar AppendBenchmark
+          -f 1 -wi 1 -i 1 -r 1s -p bytesDoValor=64
