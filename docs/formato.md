@@ -103,26 +103,47 @@ concatenado, truncado e lido a partir de qualquer posicao de registro conhecida.
 
 ## 4. Entrada de indice esparso
 
-Formato definido aqui e implementado na Fase 2. Arquivo `<offsetBase>.indice`.
+Arquivo `<offsetBase>.indice`, ao lado do arquivo de segmento de mesmo nome base.
+Uma unica entrada serve as duas buscas — por offset e por tempo.
 
 | Deslocamento | Campo | Bytes | Descricao |
 |---|---|---|---|
 | 0 | `offsetRelativo` | 4 | offset relativo ao base do segmento |
 | 4 | `posicao` | 4 | posicao em bytes do inicio do registro no arquivo de segmento |
+| 8 | `timestamp` | 8 | epoch millis do registro apontado |
 
-Entrada de 8 bytes, tamanho fixo, sem CRC. Duas consequencias:
+Entrada de **16 bytes**, tamanho fixo, sem CRC. Consequencias:
 
-- A n-esima entrada esta em `n * 8`; a busca binaria e aritmetica pura.
+- A n-esima entrada esta em `n * 16`; a busca binaria e aritmetica pura.
+- Como `offsetRelativo`, `posicao` e `timestamp` sao todos nao-decrescentes ao
+  longo do arquivo, a mesma sequencia de entradas e ordenada pelas tres chaves.
+  E por isso que um indice so resolve as duas buscas. A garantia de timestamp
+  nao-decrescente vem do append, nao do relogio — ver
+  [ADR 0005](adr/0005-timestamp-nao-decrescente.md).
 - O indice e **descartavel**. Ele nunca e a fonte de verdade: e sempre possivel
   reconstrui-lo varrendo o segmento. Por isso nao carrega CRC e nao precisa de
-  fsync. Se estiver corrompido ou truncado, e reconstruido na abertura.
+  fsync.
 
-Indice de tempo: arquivo `<offsetBase>.tempo`, mesma logica.
+### Validacao na abertura
 
-| Deslocamento | Campo | Bytes | Descricao |
-|---|---|---|---|
-| 0 | `timestamp` | 8 | epoch millis |
-| 8 | `offsetRelativo` | 4 | primeiro offset com timestamp >= este |
+O indice e lido inteiro para a memoria e cada entrada e conferida contra a
+anterior e contra o tamanho do segmento:
+
+1. `offsetRelativo` e `posicao` estritamente crescentes;
+2. `timestamp` nao-decrescente;
+3. `posicao` menor que o tamanho do arquivo de segmento.
+
+Na primeira entrada que falhar, o arquivo e truncado ali. Nao ha erro: uma
+entrada perdida custa uma varredura maior, nunca um dado errado. Se o arquivo nao
+existir e o segmento nao estiver vazio, o indice e reconstruido varrendo o
+segmento.
+
+### Intervalo
+
+Uma entrada e gravada quando o segmento cresceu `intervaloDoIndiceEmBytes` desde
+a ultima entrada (4 KiB por padrao). O indice ocupa entao cerca de
+`16 / 4096 = 0,4%` do tamanho do segmento. Ver
+[ADR 0004](adr/0004-indice-esparso-unico.md).
 
 ---
 
