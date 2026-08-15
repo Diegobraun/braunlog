@@ -66,21 +66,113 @@ Tres consequencias que valem a pena entender antes de qualquer outra coisa:
   e essa distincao decide entre truncar o arquivo e gritar. Detalhes em
   [ADR 0003](docs/adr/0003-ordem-dos-campos-do-registro.md).
 
+## Como um append funciona
+
+Diagrama: [`docs/diagramas/02-append.md`](docs/diagramas/02-append.md).
+
+O caminho e curto de proposito: valida o tamanho, decide se ainda cabe no segmento
+ativo, codifica o registro num `ByteBuffer` com CRC32C, escreve na posicao do fim
+do arquivo e **so entao** avanca o limite legivel.
+
+Essa ultima frase e a parte que importa. `limiteLegivel` e um `volatile` que
+nenhum leitor ultrapassa; ele so avanca depois de o registro inteiro estar
+escrito. Nao existe lock entre o writer e os leitores — existe uma publicacao.
+Um leitor ou ve o registro inteiro, ou nao ve registro nenhum.
+
+A entrada do indice esparso e anotada **depois** da publicacao. Se o processo cair
+entre as duas coisas, o indice perde uma entrada e o log continua correto: o
+indice e uma dica, nao a verdade.
+
+### Durabilidade, hoje
+
+`anexar` retorna quando o `write` volta — ou seja, quando os bytes estao no page
+cache do sistema operacional, nao no disco. Consequencia honesta:
+
+| Situacao | O registro sobrevive? |
+|---|---|
+| Processo morre (`kill -9`) | Sim. O page cache e do sistema operacional, nao do processo. |
+| Sistema operacional cai ou falta energia | Nao, a menos que `forcarSincronizacao()` tenha sido chamado. |
+
+Os tres modos configuraveis — `ACadaAppend`, `PorIntervalo`, `Nenhum` — entram na
+fase 3, junto com a tabela completa de garantias.
+
+### Rolagem de segmento
+
+Quando o proximo registro nao cabe em `bytesMaximosPorSegmento`, o segmento ativo
+e fechado e um novo nasce com `offsetBase` igual ao proximo offset. Um segmento
+vazio nunca rola, entao um registro maior que o limite do segmento ainda e aceito
+— ele so ocupa um segmento sozinho.
+
+## Como uma leitura funciona
+
+Diagrama: [`docs/diagramas/03-leitura.md`](docs/diagramas/03-leitura.md).
+
+```java
+try (Leitor leitor = log.lerDe(Offset.de(4_312))) { ... }
+try (Leitor leitor = log.lerDesde(Instant.parse("2026-08-15T12:00:00Z"))) { ... }
+```
+
+Tres passos: busca binaria sobre os offsets base dos segmentos para achar o
+arquivo; busca binaria no indice esparso daquele segmento para achar um ponto de
+partida; varredura para a frente ate o offset pedido. O `Leitor` e preguicoso e
+atravessa segmentos sozinho — inclusive segmentos criados depois de ele ter
+comecado a ler, o que permite acompanhar o writer sem reabrir o log.
+
+### Por que o indice e esparso, e nao denso
+
+A pergunta que ele responde nao e "onde esta o offset N", e sim **"de onde posso
+comecar a varrer sem passar do offset N"**. Um indice denso responde a primeira em
+tempo constante e cobra uma entrada por registro: 670 mil entradas num segmento de
+64 MiB com registros de 100 bytes. O esparso responde a segunda com uma entrada a
+cada 4 KiB — 16 mil entradas, 256 KiB — e a varredura restante cobre no maximo um
+intervalo, que vem do page cache numa leitura so.
+
+O detalhe que faz o desenho todo funcionar: **o indice nunca decide o que a
+leitura devolve, so de onde ela comeca**. Apagar o indice, trunca-lo ou corrompe-lo
+deixa a leitura mais lenta e igualmente correta — por isso ele nao tem CRC, nao
+entra no fsync e e reconstruido na abertura seguinte.
+
+Isso e testado de duas formas: apagando todos os indices e comparando a leitura
+([`IndiceDoLogTest`](braunlog-core/src/test/java/com/braunlog/IndiceDoLogTest.java)),
+e comparando, para dados aleatorios, a leitura com indice curto contra a leitura
+com um indice de uma entrada so — que e varredura linear
+([`LogPropriedadesTest`](braunlog-core/src/test/java/com/braunlog/LogPropriedadesTest.java)).
+
+Um efeito colateral: como nenhum teste de leitura falharia se o indice parasse de
+apontar direito, as dicas tem teste proprio em
+[`SegmentoTest`](braunlog-core/src/test/java/com/braunlog/SegmentoTest.java).
+
+### Leitura por tempo
+
+O indice esparso guarda `timestamp` na mesma entrada que guarda `posicao`, entao
+as duas buscas usam a mesma estrutura. Isso so e possivel porque o timestamp
+gravado e **nao-decrescente**: o log grava `max(relogio, ultimoTimestamp)`. Se o
+relogio da maquina voltar atras, o log nao mente sobre a ordem — perde resolucao
+naquele intervalo. Detalhes em
+[ADR 0005](docs/adr/0005-timestamp-nao-decrescente.md).
+
 ## Estado do projeto
 
 | Fase | Conteudo | Situacao |
 |---|---|---|
 | 1 | formato do registro, append e leitura num arquivo, recuperacao basica | pronta |
-| 2 | segmentos, rolagem, indice esparso, indice de tempo | proxima |
-| 3 | modos de durabilidade, recuperacao completa, concorrencia | |
+| 2 | segmentos, rolagem, indice esparso, busca por tempo, benchmark inicial | pronta |
+| 3 | modos de durabilidade, recuperacao completa, concurrency | proxima |
 | 4 | retencao e compactacao por chave | |
-| 5 | benchmarks JMH e acabamento | |
+| 5 | suite JMH completa e acabamento | |
 
 ## Como rodar
 
 ```
-mvn verify
+./mvnw verify
 ```
 
 O build so passa com cobertura de linha >= 85% (JaCoCo) e mutacao >= 85% (PIT).
 Formatacao e verificada pelo Spotless na fase `validate`.
+
+Benchmarks:
+
+```
+./mvnw -q package -DskipTests
+java -jar braunlog-benchmark/target/benchmarks.jar AppendBenchmark
+```
