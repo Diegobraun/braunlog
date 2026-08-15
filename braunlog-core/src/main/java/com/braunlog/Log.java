@@ -1,57 +1,46 @@
 package com.braunlog;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Stream;
 
 import com.braunlog.formato.FormatoRegistro;
-import com.braunlog.formato.ResultadoDecodificacao;
-import com.braunlog.formato.Varredor;
 
 /**
- * Commit log append-only, com um unico escritor e varios leitores.
+ * Commit log append-only, com um unico writer e varios leitores.
  *
- * <p>Nesta fase o log e um unico arquivo de segmento comecando no offset zero. Segmentacao entra na
- * fase 2 sem mudar esta API.
+ * <p>O log e um diretorio de segmentos. Escrever e sempre acrescentar no fim do segmento ativo; ler
+ * e varrer para a frente a partir de um ponto que o indice esparso indicou.
  */
 public final class Log implements AutoCloseable {
 
-  static final String SUFIXO_SEGMENTO = ".log";
-  private static final int DIGITOS_NOME_SEGMENTO = 20;
-  private static final long OFFSET_BASE = 0;
-
-  private final Path arquivo;
+  private final Path diretorio;
   private final ConfiguracaoLog configuracao;
-  private final FileChannel canal;
+  private final CopyOnWriteArrayList<Segmento> segmentos = new CopyOnWriteArrayList<>();
 
-  private long proximoOffset;
-  private volatile long limiteLegivel;
+  private volatile Segmento ativo;
+  private long ultimoTimestamp;
 
-  private Log(Path arquivo, ConfiguracaoLog configuracao, FileChannel canal) {
-    this.arquivo = arquivo;
+  private Log(Path diretorio, ConfiguracaoLog configuracao) {
+    this.diretorio = diretorio;
     this.configuracao = configuracao;
-    this.canal = canal;
   }
 
   public static Log abrir(Path diretorio, ConfiguracaoLog configuracao) {
     Objects.requireNonNull(diretorio, "diretorio");
     Objects.requireNonNull(configuracao, "configuracao");
+    Log log = new Log(diretorio, configuracao);
     try {
       Files.createDirectories(diretorio);
-      Path arquivo = diretorio.resolve(nomeDeSegmento(0));
-      FileChannel canal =
-          FileChannel.open(
-              arquivo,
-              StandardOpenOption.CREATE,
-              StandardOpenOption.READ,
-              StandardOpenOption.WRITE);
-      Log log = new Log(arquivo, configuracao, canal);
-      log.recuperar();
+      log.abrirSegmentos(offsetsBaseExistentes(diretorio));
       return log;
     } catch (IOException e) {
       throw new ErroDeLog("falha ao abrir log em " + diretorio, e);
@@ -63,99 +52,147 @@ public final class Log implements AutoCloseable {
     int tamanho = FormatoRegistro.tamanhoCodificado(registro);
     if (tamanho > configuracao.tamanhoMaximoRegistro()) {
       throw new ErroDeLog(
-          "registro de "
-              + tamanho
-              + " bytes excede o maximo de "
+          "registro de " + tamanho + " bytes excede o maximo de "
               + configuracao.tamanhoMaximoRegistro());
     }
-    long offset = proximoOffset;
-    ByteBuffer buffer = ByteBuffer.allocate(tamanho);
-    FormatoRegistro.codificar(buffer, registro, (int) offset, configuracao.relogio().millis());
-    buffer.flip();
-    escreverTudo(buffer, limiteLegivel);
-    proximoOffset = offset + 1;
-    limiteLegivel += tamanho;
-    return Offset.de(offset);
+    try {
+      if (ativo.bytes() > 0 && ativo.bytes() + tamanho > configuracao.bytesMaximosPorSegmento()) {
+        rolar();
+      }
+      long timestamp = Math.max(configuracao.relogio().millis(), ultimoTimestamp);
+      Offset offset = ativo.anexar(registro, timestamp);
+      ultimoTimestamp = timestamp;
+      return offset;
+    } catch (IOException e) {
+      throw new ErroDeLog("falha ao anexar em " + diretorio, e);
+    }
   }
 
   public Leitor lerDe(Offset offset) {
     Objects.requireNonNull(offset, "offset");
-    return Leitor.abrir(arquivo, configuracao, () -> limiteLegivel, OFFSET_BASE, offset);
+    return Leitor.abrir(this, offset);
+  }
+
+  /** Leitor posicionado no primeiro registro com timestamp maior ou igual ao instante pedido. */
+  public Leitor lerDesde(Instant instante) {
+    return lerDe(primeiroOffsetDesde(instante).orElseGet(this::proximoOffset));
+  }
+
+  public Optional<Offset> primeiroOffsetDesde(Instant instante) {
+    Objects.requireNonNull(instante, "instante");
+    long alvo = instante.toEpochMilli();
+    try {
+      for (Segmento segmento : segmentos) {
+        Optional<Offset> achado = segmento.primeiroOffsetComTimestamp(alvo);
+        if (achado.isPresent()) {
+          return achado;
+        }
+      }
+      return Optional.empty();
+    } catch (IOException e) {
+      throw new ErroDeLog("falha ao buscar por tempo em " + diretorio, e);
+    }
   }
 
   public Optional<Offset> ultimoOffset() {
-    long proximo = proximoOffsetVisivel();
-    return proximo == OFFSET_BASE ? Optional.empty() : Optional.of(Offset.de(proximo - 1));
+    long proximo = ativo.proximoOffset();
+    return proximo == primeiroOffsetDoLog() ? Optional.empty() : Optional.of(Offset.de(proximo - 1));
   }
 
   public Offset proximoOffset() {
-    return Offset.de(proximoOffsetVisivel());
+    return Offset.de(ativo.proximoOffset());
+  }
+
+  public int quantidadeDeSegmentos() {
+    return segmentos.size();
   }
 
   public void forcarSincronizacao() {
     try {
-      canal.force(true);
+      ativo.sincronizar();
     } catch (IOException e) {
-      throw new ErroDeLog("falha no fsync de " + arquivo, e);
+      throw new ErroDeLog("falha no fsync de " + diretorio, e);
     }
   }
 
   @Override
   public void close() {
     try {
-      canal.close();
+      for (Segmento segmento : segmentos) {
+        segmento.close();
+      }
     } catch (IOException e) {
-      throw new ErroDeLog("falha ao fechar " + arquivo, e);
+      throw new ErroDeLog("falha ao fechar log em " + diretorio, e);
     }
   }
 
-  static String nomeDeSegmento(long offsetBase) {
-    return ("%0" + DIGITOS_NOME_SEGMENTO + "d" + SUFIXO_SEGMENTO).formatted(offsetBase);
+  Segmento segmentoQueContem(long offset) {
+    List<Segmento> retrato = segmentos;
+    int inferior = 0;
+    int superior = retrato.size() - 1;
+    int escolhido = 0;
+    while (inferior <= superior) {
+      int meio = (inferior + superior) >>> 1;
+      if (retrato.get(meio).offsetBase() <= offset) {
+        escolhido = meio;
+        inferior = meio + 1;
+      } else {
+        superior = meio - 1;
+      }
+    }
+    return retrato.get(escolhido);
   }
 
-  private synchronized long proximoOffsetVisivel() {
-    return proximoOffset;
+  Optional<Segmento> segmentoApos(Segmento segmento) {
+    List<Segmento> retrato = segmentos;
+    int posicao = retrato.indexOf(segmento) + 1;
+    return posicao < retrato.size() ? Optional.of(retrato.get(posicao)) : Optional.empty();
   }
 
-  private void escreverTudo(ByteBuffer buffer, long posicao) {
+  private long primeiroOffsetDoLog() {
+    return segmentos.getFirst().offsetBase();
+  }
+
+  private void abrirSegmentos(List<Long> offsetsBase) throws IOException {
+    for (int i = 0; i < offsetsBase.size(); i++) {
+      boolean ultimo = i == offsetsBase.size() - 1;
+      Segmento segmento = Segmento.abrir(diretorio, offsetsBase.get(i), configuracao, ultimo);
+      segmentos.add(segmento);
+      ultimoTimestamp = Math.max(ultimoTimestamp, segmento.ultimoTimestamp());
+    }
+    ativo = segmentos.getLast();
+  }
+
+  private void rolar() throws IOException {
+    Segmento novo = Segmento.abrir(diretorio, ativo.proximoOffset(), configuracao, true);
+    segmentos.add(novo);
+    ativo = novo;
+  }
+
+  /** Arquivos com nome fora da convencao sao ignorados: o diretorio pode ser de outra pessoa. */
+  private static List<Long> offsetsBaseExistentes(Path diretorio) throws IOException {
+    List<Long> offsetsBase = new ArrayList<>();
+    try (Stream<Path> arquivos = Files.list(diretorio)) {
+      for (Path arquivo : arquivos.toList()) {
+        offsetBaseDoNome(arquivo.getFileName().toString()).ifPresent(offsetsBase::add);
+      }
+    }
+    Collections.sort(offsetsBase);
+    if (offsetsBase.isEmpty()) {
+      offsetsBase.add(0L);
+    }
+    return offsetsBase;
+  }
+
+  private static Optional<Long> offsetBaseDoNome(String nome) {
+    if (!nome.endsWith(Segmento.SUFIXO_SEGMENTO)) {
+      return Optional.empty();
+    }
     try {
-      while (buffer.hasRemaining()) {
-        canal.write(buffer, posicao + buffer.position());
-      }
-    } catch (IOException e) {
-      throw new ErroDeLog("falha ao escrever em " + arquivo, e);
+      return Optional.of(
+          Long.parseLong(nome.substring(0, nome.length() - Segmento.SUFIXO_SEGMENTO.length())));
+    } catch (NumberFormatException naoEhSegmentoNosso) {
+      return Optional.empty();
     }
-  }
-
-  /**
-   * Varre o segmento na abertura para descobrir onde continuar escrevendo. Um registro parcial no
-   * fim e o rastro esperado de uma queda: o arquivo e truncado ali, porque deixar bytes orfaos
-   * depois do proximo append transformaria escrita parcial em corrupcao.
-   */
-  private void recuperar() throws IOException {
-    Varredor varredor = new Varredor(canal, configuracao.tamanhoMaximoRegistro());
-    long tamanhoArquivo = canal.size();
-    long posicao = 0;
-    long offset = OFFSET_BASE;
-    boolean varrendo = true;
-    while (varrendo) {
-      switch (varredor.ler(posicao, tamanhoArquivo, OFFSET_BASE)) {
-        case ResultadoDecodificacao.Sucesso sucesso -> {
-          posicao += sucesso.bytesConsumidos();
-          offset = sucesso.registro().offset().valor() + 1;
-        }
-        case ResultadoDecodificacao.Corrompido corrompido ->
-            throw new ErroDeCorrupcao(
-                "segmento " + arquivo + " corrompido na posicao " + posicao + ": "
-                    + corrompido.motivo());
-        case ResultadoDecodificacao.Parcial ignorado -> varrendo = false;
-        case ResultadoDecodificacao.Fim ignorado -> varrendo = false;
-      }
-    }
-    if (posicao < tamanhoArquivo) {
-      canal.truncate(posicao);
-    }
-    proximoOffset = offset;
-    limiteLegivel = posicao;
   }
 }

@@ -6,6 +6,7 @@ import static com.braunlog.LogTest.todos;
 import static com.braunlog.Suporte.configuracaoPadrao;
 import static com.braunlog.Suporte.registro;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -15,6 +16,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.stream.IntStream;
 
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -80,7 +82,7 @@ class RecuperacaoTest {
     Log.abrir(diretorio, configuracaoPadrao()).close();
 
     // then
-    assertThat(Files.size(diretorio.resolve(Log.nomeDeSegmento(0))))
+    assertThat(Files.size(diretorio.resolve(Segmento.nomeDeArquivo(0))))
         .isEqualTo(AmostraDeLog.tamanhoDosPrimeiros(intactos));
   }
 
@@ -100,6 +102,40 @@ class RecuperacaoTest {
     assertThat(lidos).hasSizeLessThan(AmostraDeLog.esperados().size());
   }
 
+  /**
+   * A varredura de abertura comeca na ultima entrada do indice, entao corrupcao antes dela nao e
+   * vista ali. A garantia continua valendo, so muda o momento: quem detecta e a leitura do registro.
+   */
+  @Test
+  void deveDetectarNaLeituraACorrupcaoQueAAberturaNaoVarreu() throws IOException {
+    // given
+    ConfiguracaoLog configuracao = configuracaoPadrao().comIntervaloDoIndiceEmBytes(64);
+    try (Log log = Log.abrir(diretorio, configuracao)) {
+      for (int i = 0; i < 40; i++) {
+        log.anexar(registro("chave-%02d".formatted(i), "valor-%02d".formatted(i)));
+      }
+      assertThat(log.segmentoQueContem(0).entradasNoIndice()).isGreaterThan(1);
+    }
+    corromperByteDoPrimeiroRegistro();
+
+    // when
+    try (Log reaberto = Log.abrir(diretorio, configuracao)) {
+
+      // then
+      assertThatThrownBy(() -> todos(reaberto, Offset.ZERO))
+          .isInstanceOf(ErroDeCorrupcao.class)
+          .hasMessageContaining(Segmento.nomeDeArquivo(0));
+    }
+  }
+
+  private void corromperByteDoPrimeiroRegistro() throws IOException {
+    Path arquivo = diretorio.resolve(Segmento.nomeDeArquivo(0));
+    byte[] conteudo = Files.readAllBytes(arquivo);
+    int byteDoTimestamp = 14;
+    conteudo[byteDoTimestamp] = (byte) ~conteudo[byteDoTimestamp];
+    Files.write(arquivo, conteudo);
+  }
+
   private List<RegistroLido> lerOQueForPossivel() {
     try (Log log = Log.abrir(diretorio, configuracaoPadrao())) {
       return todos(log, Offset.ZERO);
@@ -110,7 +146,7 @@ class RecuperacaoTest {
 
   private void escreverSegmento(byte[] conteudo) {
     try {
-      Files.write(diretorio.resolve(Log.nomeDeSegmento(0)), conteudo);
+      Files.write(diretorio.resolve(Segmento.nomeDeArquivo(0)), conteudo);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

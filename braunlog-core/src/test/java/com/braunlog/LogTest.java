@@ -164,7 +164,7 @@ class LogTest {
     // when / then
     assertThatThrownBy(() -> log.anexar(registro("a", "1")))
         .isInstanceOf(ErroDeLog.class)
-        .hasMessageContaining("falha ao escrever");
+        .hasMessageContaining("falha ao anexar");
   }
 
   @Test
@@ -220,14 +220,14 @@ class LogTest {
       log.anexar(registro("a", "1"));
 
       // then
-      assertThat(aninhado.resolve(Log.nomeDeSegmento(0))).exists();
+      assertThat(aninhado.resolve(Segmento.nomeDeArquivo(0))).exists();
     }
   }
 
   @Test
   void deveNomearOSegmentoPeloOffsetBaseComVinteDigitos() {
     // when
-    String nome = Log.nomeDeSegmento(10_423);
+    String nome = Segmento.nomeDeArquivo(10_423);
 
     // then
     assertThat(nome).isEqualTo("00000000000000010423.log");

@@ -1,61 +1,40 @@
 package com.braunlog;
 
 import java.io.IOException;
-import java.nio.channels.FileChannel;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
-import java.util.function.LongSupplier;
+import java.util.Optional;
 
 import com.braunlog.formato.ResultadoDecodificacao;
-import com.braunlog.formato.Varredor;
 
 /**
- * Iterador preguicoso sobre o log. Abre o proprio canal de leitura, entao varios leitores convivem
- * com o escritor sem sincronizacao entre eles.
+ * Iterador preguicoso sobre o log, atravessando segmentos.
  *
- * <p>Invariante de concorrencia: nenhuma leitura passa de {@code limiteLegivel}, que so avanca
+ * <p>Invariante de concurrency: nenhuma leitura passa do limite legivel do segmento, que so avanca
  * depois de um registro inteiro ter sido escrito. E isso, e nao um lock, que impede um leitor de ver
- * meio registro.
+ * meio registro. Um leitor que chegou ao fim do segmento ativo enxerga a rolagem na chamada
+ * seguinte, entao da para acompanhar o writer sem reabrir o log.
  */
 public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
 
-  private final FileChannel canal;
-  private final Varredor varredor;
-  private final LongSupplier limiteLegivel;
-  private final long offsetBase;
+  private final Log log;
   private final Offset offsetMinimo;
 
+  private Segmento segmento;
   private long posicao;
   private RegistroLido pendente;
+  private boolean fechado;
 
-  private Leitor(
-      FileChannel canal,
-      int tamanhoMaximoRegistro,
-      LongSupplier limiteLegivel,
-      long offsetBase,
-      Offset offsetMinimo) {
-    this.canal = canal;
-    this.varredor = new Varredor(canal, tamanhoMaximoRegistro);
-    this.limiteLegivel = limiteLegivel;
-    this.offsetBase = offsetBase;
+  private Leitor(Log log, Offset offsetMinimo, Segmento segmento, long posicao) {
+    this.log = log;
     this.offsetMinimo = offsetMinimo;
+    this.segmento = segmento;
+    this.posicao = posicao;
   }
 
-  static Leitor abrir(
-      Path arquivo,
-      ConfiguracaoLog configuracao,
-      LongSupplier limiteLegivel,
-      long offsetBase,
-      Offset offsetMinimo) {
-    try {
-      FileChannel canal = FileChannel.open(arquivo, StandardOpenOption.READ);
-      return new Leitor(
-          canal, configuracao.tamanhoMaximoRegistro(), limiteLegivel, offsetBase, offsetMinimo);
-    } catch (IOException e) {
-      throw new ErroDeLog("falha ao abrir leitura de " + arquivo, e);
-    }
+  static Leitor abrir(Log log, Offset offsetMinimo) {
+    Segmento segmento = log.segmentoQueContem(offsetMinimo.valor());
+    return new Leitor(log, offsetMinimo, segmento, segmento.posicaoParaOffset(offsetMinimo.valor()));
   }
 
   @Override
@@ -78,19 +57,16 @@ public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
 
   @Override
   public void close() {
-    try {
-      canal.close();
-    } catch (IOException e) {
-      throw new ErroDeLog("falha ao fechar leitor", e);
-    }
+    fechado = true;
   }
 
   private RegistroLido proximoRegistro() {
+    if (fechado) {
+      throw new ErroDeLog("leitor ja fechado");
+    }
     try {
       while (true) {
-        ResultadoDecodificacao resultado =
-            varredor.ler(posicao, limiteLegivel.getAsLong(), offsetBase);
-        switch (resultado) {
+        switch (segmento.ler(posicao)) {
           case ResultadoDecodificacao.Sucesso sucesso -> {
             posicao += sucesso.bytesConsumidos();
             if (sucesso.registro().offset().compareTo(offsetMinimo) >= 0) {
@@ -99,17 +75,23 @@ public final class Leitor implements Iterator<RegistroLido>, AutoCloseable {
           }
           case ResultadoDecodificacao.Corrompido corrompido ->
               throw new ErroDeCorrupcao(
-                  "registro corrompido na posicao " + posicao + ": " + corrompido.motivo());
+                  "registro corrompido em " + segmento.arquivo() + " na posicao " + posicao + ": "
+                      + corrompido.motivo());
           case ResultadoDecodificacao.Parcial ignorado -> {
             return null;
           }
           case ResultadoDecodificacao.Fim ignorado -> {
-            return null;
+            Optional<Segmento> proximo = log.segmentoApos(segmento);
+            if (proximo.isEmpty()) {
+              return null;
+            }
+            segmento = proximo.get();
+            posicao = 0;
           }
         }
       }
     } catch (IOException e) {
-      throw new ErroDeLog("falha ao ler na posicao " + posicao, e);
+      throw new ErroDeLog("falha ao ler " + segmento.arquivo() + " na posicao " + posicao, e);
     }
   }
 }

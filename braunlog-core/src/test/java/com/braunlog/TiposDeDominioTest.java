@@ -74,17 +74,36 @@ class TiposDeDominioTest {
   }
 
   @Test
-  void configuracaoDeveRecusarRelogioNuloETamanhoMaximoAbsurdo() {
-    assertThatThrownBy(() -> new ConfiguracaoLog(null, 1024))
+  void configuracaoDeveRecusarValoresIncoerentes() {
+    ConfiguracaoLog padrao = ConfiguracaoLog.padrao(relogioFixo());
+
+    assertThatThrownBy(() -> new ConfiguracaoLog(null, 1024, 1 << 20, 4096))
         .isInstanceOf(NullPointerException.class);
-    assertThatThrownBy(() -> ConfiguracaoLog.padrao(relogioFixo()).comTamanhoMaximoRegistro(4))
+    assertThatThrownBy(() -> padrao.comTamanhoMaximoRegistro(4))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("pequeno demais");
+    assertThatThrownBy(() -> padrao.comBytesMaximosPorSegmento(1024))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("menor que o maior registro");
+    assertThatThrownBy(() -> padrao.comIntervaloDoIndiceEmBytes(0))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("intervalo do indice");
   }
 
   @Test
-  void configuracaoPadraoDeveUsarOTetoDeUmMegabyte() {
-    assertThat(ConfiguracaoLog.padrao(relogioFixo()).tamanhoMaximoRegistro())
+  void configuracaoPadraoDeveTrazerOsTetosDocumentados() {
+    ConfiguracaoLog padrao = ConfiguracaoLog.padrao(relogioFixo());
+
+    assertThat(padrao.tamanhoMaximoRegistro())
         .isEqualTo(ConfiguracaoLog.TAMANHO_MAXIMO_REGISTRO_PADRAO);
+    assertThat(padrao.bytesMaximosPorSegmento())
+        .isEqualTo(ConfiguracaoLog.BYTES_MAXIMOS_POR_SEGMENTO_PADRAO);
+    assertThat(padrao.intervaloDoIndiceEmBytes())
+        .isEqualTo(ConfiguracaoLog.INTERVALO_DO_INDICE_EM_BYTES_PADRAO);
+    assertThat(padrao.comTamanhoMaximoRegistro(512).tamanhoMaximoRegistro()).isEqualTo(512);
+    assertThat(padrao.comTamanhoMaximoRegistro(512).comBytesMaximosPorSegmento(4096)
+            .bytesMaximosPorSegmento())
+        .isEqualTo(4096);
+    assertThat(padrao.comIntervaloDoIndiceEmBytes(64).intervaloDoIndiceEmBytes()).isEqualTo(64);
   }
 }
