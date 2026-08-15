@@ -83,18 +83,39 @@ A entrada do indice esparso e anotada **depois** da publicacao. Se o processo ca
 entre as duas coisas, o indice perde uma entrada e o log continua correto: o
 indice e uma dica, nao a verdade.
 
-### Durabilidade, hoje
+### Os tres modos de durabilidade
 
-`anexar` retorna quando o `write` volta — ou seja, quando os bytes estao no page
-cache do sistema operacional, nao no disco. Consequencia honesta:
+```java
+ConfiguracaoLog.padrao(Clock.systemUTC())
+    .comModoDurabilidade(ModoDurabilidade.A_CADA_APPEND);
+```
 
-| Situacao | O registro sobrevive? |
-|---|---|
-| Processo morre (`kill -9`) | Sim. O page cache e do sistema operacional, nao do processo. |
-| Sistema operacional cai ou falta energia | Nao, a menos que `forcarSincronizacao()` tenha sido chamado. |
+| Modo | O que significa | O que pode ser perdido |
+|---|---|---|
+| `ACadaAppend` | `fsync` antes de `anexar` retornar | Nada depois do retorno. Custo: uma chamada de `fsync` por registro. |
+| `PorIntervalo(d)` | `fsync` no primeiro append depois de vencido `d` | Ate `d` de escritas, se o sistema operacional cair. **Com o log ocioso, nada e sincronizado**: nao existe thread de background. |
+| `Nenhum` (padrao) | Nunca chama `fsync` sozinho | Tudo que ainda estiver no page cache, se o sistema operacional cair. |
 
-Os tres modos configuraveis — `ACadaAppend`, `PorIntervalo`, `Nenhum` — entram na
-fase 3, junto com a tabela completa de garantias.
+Duas quedas diferentes, que costumam ser confundidas:
+
+- **Queda do processo** (`kill -9`): o page cache pertence ao sistema operacional
+  e continua vivo. **Nenhum dado e perdido, em nenhum dos tres modos.** Isso e
+  testado matando de verdade uma JVM filha com `SIGKILL`:
+  [`QuedaDeProcessoTest`](braunlog-core/src/test/java/com/braunlog/QuedaDeProcessoTest.java).
+- **Queda do sistema operacional** ou falta de energia: vale a tabela acima. Nao
+  ha como provar isso de dentro de um teste, entao esta linha esta **declarada, e
+  nao afirmada** — o que da para provar e que cada modo chama `fsync` quando diz
+  que chama, e `Log#quantidadeDeSincronizacoes()` existe para que voce possa
+  conferir isso de fora, em producao.
+
+`close()` sincroniza antes de fechar, exceto no modo `Nenhum` — quem escolheu esse
+modo pediu que o braunlog nunca chamasse `fsync`, e fechar nao e motivo para
+desobedecer. Detalhes em [ADR 0006](docs/adr/0006-modos-de-durabilidade-sem-thread.md).
+
+Na rolagem de segmento ha um `fsync` a mais, no **diretorio**: sincronizar o
+arquivo nao grava a entrada dele no diretorio, e sem isso um segmento novo pode
+sumir numa queda de energia mesmo com o conteudo ja duravel
+([ADR 0007](docs/adr/0007-fsync-do-diretorio-na-rolagem.md)).
 
 ### Rolagem de segmento
 
@@ -151,14 +172,67 @@ relogio da maquina voltar atras, o log nao mente sobre a ordem — perde resoluc
 naquele intervalo. Detalhes em
 [ADR 0005](docs/adr/0005-timestamp-nao-decrescente.md).
 
+## Recuperacao apos queda
+
+Diagrama: [`docs/diagramas/04-recuperacao.md`](docs/diagramas/04-recuperacao.md).
+
+Abrir um log e responder uma pergunta: **onde continuar escrevendo?** O caminho
+ate essa resposta toma tres decisoes que valem ser entendidas.
+
+**Parcial nao e corrupcao.** Um registro cortado no meio, no fim do ultimo
+segmento, e o rastro esperado de uma queda no meio de um append — o arquivo e
+truncado ali e a vida segue. A mesma cauda parcial num segmento **fechado** e
+corrupcao, porque nenhum caminho de codigo produz isso. E o campo `tamanho` vir
+antes do `crc` que torna essa distincao possivel sem ler o arquivo inteiro.
+
+**Truncar e obrigatorio.** Se os bytes parciais ficassem no disco, o proximo
+append escreveria por cima do comeco deles e, se o registro novo fosse menor,
+sobraria uma cauda de lixo que a leitura seguinte leria como registro. Escrita
+parcial viraria corrupcao. Por isso o teste varre **todas** as posicoes de corte
+possiveis, e nao uma amostra.
+
+**A varredura comeca na ultima entrada do indice.** Abrir um log de 10 GB custa o
+mesmo que abrir um de 10 MB. O preco esta declarado: corrupcao anterior a esse
+ponto e detectada quando o registro for lido, nao na abertura.
+
+## Garantias e nao-garantias
+
+Nenhuma linha desta tabela esta aqui sem um teste que a prove.
+
+| Garantia | Condicao | Prova |
+|---|---|---|
+| Registro lido e identico ao escrito | sempre | [`FormatoRegistroPropriedadesTest#oRegistroDecodificadoDeveSerIdenticoAoCodificado`](braunlog-core/src/test/java/com/braunlog/formato/FormatoRegistroPropriedadesTest.java), [`LogPropriedadesTest#tudoQueFoiAnexadoDeveVoltarIgualNaMesmaOrdem`](braunlog-core/src/test/java/com/braunlog/LogPropriedadesTest.java) |
+| Corrupcao e detectada, nunca devolvida | sempre | [`RecuperacaoTest#deveDetectarCorrupcaoDeQualquerByteSemNuncaDevolverRegistroDiferenteDoEscrito`](braunlog-core/src/test/java/com/braunlog/RecuperacaoTest.java) — inverte cada byte de um segmento, um de cada vez |
+| Corrupcao anterior ao ponto de varredura e detectada **na leitura**, nao na abertura | sempre | [`RecuperacaoTest#deveDetectarNaLeituraACorrupcaoQueAAberturaNaoVarreu`](braunlog-core/src/test/java/com/braunlog/RecuperacaoTest.java) |
+| Escrita parcial nao e lida como valida | sempre | [`RecuperacaoTest#deveRecuperarTruncandoRegistroParcialEmQualquerPosicaoDeCorte`](braunlog-core/src/test/java/com/braunlog/RecuperacaoTest.java) e [`RecuperacaoComSegmentosTest#deveTruncarCaudaParcialDoUltimoSegmentoEmQualquerPosicaoDeCorte`](braunlog-core/src/test/java/com/braunlog/RecuperacaoComSegmentosTest.java) — **toda** posicao de corte |
+| Depois da recuperacao da para continuar escrevendo | sempre | os dois testes acima anexam e conferem o offset resultante |
+| Offset e monotonico e sem lacuna | sempre | [`SegmentacaoTest#deveManterOffsetContinuoESemLacunaEntreSegmentos`](braunlog-core/src/test/java/com/braunlog/SegmentacaoTest.java), verificado tambem em todo teste de recuperacao |
+| Registro confirmado sobrevive a queda do **processo** | nos tres modos | [`QuedaDeProcessoTest#registroConfirmadoDeveSobreviverAoKillDoProcessoEmQualquerModo`](braunlog-core/src/test/java/com/braunlog/QuedaDeProcessoTest.java) — `SIGKILL` numa JVM filha de verdade |
+| Registro confirmado sobrevive a queda do **sistema operacional** | apenas modo `ACadaAppend` | **declarado, nao provado** — nao ha como derrubar o sistema operacional de dentro de um teste. O que e provado e que o modo chama `fsync` uma vez por registro: [`DurabilidadeTest#modoACadaAppendDeveSincronizarUmaVezPorRegistro`](braunlog-core/src/test/java/com/braunlog/DurabilidadeTest.java) |
+| Registro confirmado **pode ser perdido** numa queda do sistema operacional | modos `PorIntervalo` e `Nenhum` | [`DurabilidadeTest#modoNenhumNuncaDeveSincronizarSozinho`](braunlog-core/src/test/java/com/braunlog/DurabilidadeTest.java) e [`#modoPorIntervaloNaoDeveSincronizarSozinhoComOLogOcioso`](braunlog-core/src/test/java/com/braunlog/DurabilidadeTest.java) mostram que o `fsync` nao acontece |
+| Leitura concorrente durante escrita nao ve registro incompleto nem lacuna | sempre | [`ConcurrencyTest`](braunlog-core/src/test/java/com/braunlog/ConcurrencyTest.java) — um writer, quatro leitores, inclusive atravessando rolagem de segmento |
+| O indice nao muda o que a leitura devolve | sempre | [`IndiceDoLogTest#oIndiceNaoDeveMudarOQueALeituraDevolve`](braunlog-core/src/test/java/com/braunlog/IndiceDoLogTest.java), [`LogPropriedadesTest#oIndiceEsparsoDeveConcordarComAVarreduraLinear`](braunlog-core/src/test/java/com/braunlog/LogPropriedadesTest.java) |
+| Timestamp gravado e nao-decrescente | sempre | [`BuscaPorTempoTest#deveGravarTimestampNaoDecrescenteQuandoORelogioVoltaAtras`](braunlog-core/src/test/java/com/braunlog/BuscaPorTempoTest.java) |
+
+### O que o braunlog **nao** garante
+
+- Nao ha replicacao, consenso nem alta disponibilidade. Um disco, um processo.
+- Nao ha protocolo de rede, broker nem consumer group.
+- Nao ha transacao, exactly-once nem ordenacao entre logs diferentes.
+- `PorIntervalo` nao da teto de tempo com o log ocioso ([ADR 0006](docs/adr/0006-modos-de-durabilidade-sem-thread.md)).
+- Se o relogio da maquina voltar atras, o timestamp gravado perde resolucao
+  naquele intervalo ([ADR 0005](docs/adr/0005-timestamp-nao-decrescente.md)).
+- Um unico writer. `anexar` e `synchronized`, entao chamar de varias threads e
+  seguro, mas nao e mais rapido.
+
 ## Estado do projeto
 
 | Fase | Conteudo | Situacao |
 |---|---|---|
 | 1 | formato do registro, append e leitura num arquivo, recuperacao basica | pronta |
 | 2 | segmentos, rolagem, indice esparso, busca por tempo, benchmark inicial | pronta |
-| 3 | modos de durabilidade, recuperacao completa, concurrency | proxima |
-| 4 | retencao e compactacao por chave | |
+| 3 | modos de durabilidade, recuperacao completa, concurrency | pronta |
+| 4 | retencao e compactacao por chave | proxima |
 | 5 | suite JMH completa e acabamento | |
 
 ## Como rodar
