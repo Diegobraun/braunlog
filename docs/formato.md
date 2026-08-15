@@ -99,6 +99,15 @@ Um arquivo de segmento e uma sequencia de registros concatenados, sem cabecalho
 de arquivo e sem rodape. Isso e proposital: um arquivo sem cabecalho pode ser
 concatenado, truncado e lido a partir de qualquer posicao de registro conhecida.
 
+### Offsets com lacuna
+
+`offsetRelativo` e gravado em cada registro e **nunca** deduzido da posicao ou da
+contagem. E por isso que um segmento compactado pode conter, em sequencia, os
+offsets relativos 3, 7 e 12: a compactacao preserva o offset original de cada
+registro que sobrevive. Um leitor nunca deve assumir que o proximo registro tem o
+offset do anterior mais um. Ver
+[ADR 0009](adr/0009-compactacao-preserva-offset-e-tombstone.md).
+
 ---
 
 ## 4. Entrada de indice esparso

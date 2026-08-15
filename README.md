@@ -320,7 +320,122 @@ Nenhuma linha desta tabela esta aqui sem um teste que a prove.
 | 2 | segmentos, rolagem, indice esparso, busca por tempo, benchmark inicial | pronta |
 | 3 | modos de durabilidade, recuperacao completa, concurrency | pronta |
 | 4 | retencao e compactacao por chave | pronta |
-| 5 | suite JMH completa e acabamento | proxima |
+| 5 | suite JMH completa e acabamento | pronta |
+
+## Benchmarks
+
+> **Aviso:** estes numeros existem para mostrar a forma das curvas — o efeito do
+> fsync, do lote, do tamanho do registro e do intervalo do indice. Eles **nao sao
+> comparacao com o Kafka** e nao fazem sentido fora do hardware declarado. Um
+> commit log embarcado e um broker distribuido resolvem problemas diferentes;
+> comparar os dois numeros seria desonesto.
+
+A suite fica em `braunlog-benchmark`, com JMH:
+
+```
+./mvnw -q package -DskipTests
+java -jar braunlog-benchmark/target/benchmarks.jar
+```
+
+| Benchmark | O que mede |
+|---|---|
+| `AppendBenchmark` | throughput de append por tamanho do valor (64, 512, 4096 bytes) |
+| `DurabilidadeBenchmark` | tempo medio de um append em cada modo de durabilidade |
+| `LoteBenchmark` | tempo de um lote de N registros com um unico `fsync` no fim |
+| `LeituraBenchmark` | leitura sequencial, leitura por offset aleatorio, e efeito do intervalo do indice esparso |
+
+### Como ler os resultados
+
+Tres coisas aparecem sempre, e vale saber o que esperar antes de rodar:
+
+- **O `fsync` domina tudo.** A diferenca entre `Nenhum` e `ACadaAppend` nao e uma
+  constante do braunlog, e do dispositivo: e o tempo que o SSD leva para
+  confirmar uma escrita durável. Nenhuma otimizacao de codigo mexe nisso.
+- **O lote dilui esse custo.** Um `fsync` a cada 100 registros custa 1/100 por
+  registro. E o mesmo raciocinio do `linger.ms` do Kafka, sem nenhuma magia — e a
+  razao de todo sistema de log oferecer alguma forma de lote.
+- **O intervalo do indice troca memoria por varredura.** Intervalo maior significa
+  indice menor e varredura mais longa depois da busca binaria. Na leitura
+  sequencial ele nao muda nada, porque o indice so e consultado no
+  posicionamento inicial.
+
+### Numeros medidos
+
+Ainda nao publicados nesta versao: a maquina de referencia estava ocupada com
+outra medicao quando esta fase foi fechada, e numero de benchmark colhido com a
+CPU disputada nao vale como numero. A tabela entra assim que a suite rodar com a
+maquina em repouso, junto com o hardware declarado (modelo de CPU, memoria,
+sistema de arquivos e versao do JDK).
+
+## Limitacoes, e o que eu faria diferente em producao
+
+**Descritor de arquivo por segmento.** Todo segmento fica com o arquivo aberto
+enquanto o log estiver aberto. Um log com milhares de segmentos precisa de
+`ulimit` folgado. Em producao eu fecharia segmentos frios sob demanda, com um
+cache de descritores — o Kafka tem exatamente esse problema e exatamente essa
+solucao.
+
+**Retencao e compactacao sao sincronas.** As duas rodam na thread de quem chamou
+`anexar` (na rolagem) ou `compactar`. Compactar um segmento grande trava o writer
+por todo o tempo da reescrita. Em producao isso e uma thread separada com
+limitacao de banda — e ai aparece toda a complexidade de coordenacao que este
+projeto evitou de proposito.
+
+**`PorIntervalo` nao tem teto real com o log ocioso.** Sem thread de background,
+o `fsync` so acontece no proximo append ([ADR 0006](docs/adr/0006-modos-de-durabilidade-sem-thread.md)).
+
+**Tombstone nunca some.** Chave deletada deixa ~30 bytes para sempre. A solucao de
+verdade e o `delete.retention.ms` do Kafka, que exige uma nocao de "consumidor
+mais atrasado" ([ADR 0009](docs/adr/0009-compactacao-preserva-offset-e-tombstone.md)).
+
+**Compactar carrega todas as chaves em memoria.** Nenhum valor, mas o numero de
+chaves distintas importa. Em producao, um mapa fora do heap ou compactacao por
+faixas de offset.
+
+**Uma syscall de leitura por registro.** O `Varredor` le o cabecalho e depois o
+corpo. Um buffer de leitura maior, amortizado entre registros, e a otimizacao
+obvia — e ela so entra depois de o benchmark mostrar que vale
+([ADR 0001](docs/adr/0001-io-posicional-em-vez-de-mmap.md)).
+
+**Sem checksum no indice.** De proposito: o indice e descartavel. Mas isso
+significa que um indice corrompido de forma "coerente" — offsets e posicoes
+crescentes, apontando para lugares errados — passaria pela validacao e faria a
+varredura comecar no meio de um registro, acusando corrupcao num segmento
+intacto. A validacao cobre truncamento e lixo, nao corrupcao maliciosa.
+
+**Um writer so.** `anexar` e `synchronized`. Escrita paralela exigiria alocar
+offsets e posicoes de forma atomica e publicar fora de ordem — e a ordem e metade
+do valor de um commit log.
+
+## Referencias
+
+O que foi lido para construir isto:
+
+- **Kafka — documentacao de design do log**:
+  [Log](https://kafka.apache.org/documentation/#log) e
+  [Log Compaction](https://kafka.apache.org/documentation/#design_compactionbasics).
+  A fonte direta do formato de segmento, do indice esparso e da compactacao por
+  chave.
+- **Jay Kreps, "The Log: What every software engineer should know about real-time
+  data's unifying abstraction"** (2013). O texto que explica por que o log e uma
+  abstracao, e nao um detalhe de implementacao.
+- **Patrick O'Neil et al., "The Log-Structured Merge-Tree (LSM-Tree)"** (1996). De
+  onde vem a ideia de que escrita sequencial mais compactacao em segundo plano
+  ganha de atualizacao em lugar.
+- **Mendel Rosenblum e John Ousterhout, "The Design and Implementation of a
+  Log-Structured File System"** (1992). O artigo original da escrita sequencial
+  como estrutura, incluindo o problema do espaco livre que vira retencao aqui.
+- **Martin Kleppmann, _Designing Data-Intensive Applications_**, capitulos 3 e 11.
+  A ponte entre o log como estrutura de armazenamento e o log como fluxo.
+- **Pillai et al., "All File Systems Are Not Created Equal: On the Complexity of
+  Crafting Crash-Consistent Applications"** (OSDI 2014). A origem da regra de
+  sincronizar o diretorio, e um bom susto sobre o que os sistemas de arquivos
+  realmente garantem.
+- **Dan Luu, "Files are hard"** (2015). Resumo curto e util do mesmo assunto.
+- **Guy Castagnoli et al., "Optimization of Cyclic Redundancy-Check Codes with 24
+  and 32 Parity Bits"** (1993). O polinomio do CRC32C.
+- **JEP 441 (pattern matching for switch)** e o guia de records do JDK, para o uso
+  de `sealed interface` como resultado exaustivo.
 
 ## Como rodar
 
@@ -329,11 +444,12 @@ Nenhuma linha desta tabela esta aqui sem um teste que a prove.
 ```
 
 O build so passa com cobertura de linha >= 85% (JaCoCo) e mutacao >= 85% (PIT).
-Formatacao e verificada pelo Spotless na fase `validate`.
-
-Benchmarks:
+Formatacao e verificada pelo Spotless na fase `validate`. A analise de mutacao e a
+parte demorada; para um ciclo rapido durante o desenvolvimento:
 
 ```
-./mvnw -q package -DskipTests
-java -jar braunlog-benchmark/target/benchmarks.jar AppendBenchmark
+./mvnw verify -Dpitest.skip=true
 ```
+
+O CI roda o `verify` completo e guarda os relatorios de cobertura e mutacao como
+artefato. Os benchmarks estao na secao [Benchmarks](#benchmarks).
