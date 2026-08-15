@@ -195,6 +195,81 @@ possiveis, e nao uma amostra.
 mesmo que abrir um de 10 MB. O preco esta declarado: corrupcao anterior a esse
 ponto e detectada quando o registro for lido, nao na abertura.
 
+## Retencao e compactacao
+
+Sao duas formas de o log parar de crescer, e elas respondem perguntas diferentes:
+retencao joga fora **o que e velho**; compactacao joga fora **o que foi
+substituido**.
+
+### Retencao apaga segmento inteiro — e essa e a unica opcao sa
+
+```java
+ConfiguracaoLog.padrao(relogio)
+    .comPoliticaRetencao(PoliticaRetencao.combinada(
+        PoliticaRetencao.porTamanhoTotal(10L << 30),
+        PoliticaRetencao.porIdade(Duration.ofDays(7))));
+```
+
+"Apagar os registros com mais de sete dias" parece razoavel e nao existe num log
+append-only. Apagar 200 bytes do meio de um arquivo obriga a mover todo o resto
+para tras — o custo de I/O de uma copia completa para liberar 200 bytes — e ainda:
+
+- todas as entradas do indice depois do buraco passam a apontar para o meio de um
+  registro;
+- escrever no meio do arquivo quebra a premissa que sustenta toda a recuperacao,
+  que e "registro incompleto so pode existir no fim";
+- um leitor concorrente veria o chao se mexer embaixo dele.
+
+Apagar um arquivo inteiro nao tem nenhum desses problemas. O preco e a
+granularidade: **o log so encolhe de um segmento por vez**, e o segmento ativo
+nunca e apagado. Detalhes em [ADR 0008](docs/adr/0008-retencao-apaga-segmento-inteiro.md).
+
+A retencao roda na abertura e a cada rolagem, sem thread de background — entao o
+teto de tamanho e aproximado. `log.aplicarRetencao()` forca na hora.
+
+### Compactacao mantem o ultimo valor de cada chave
+
+Diagrama: [`docs/diagramas/05-compactacao.md`](docs/diagramas/05-compactacao.md).
+
+```
+antes    offset: 0    1    2    3    4    5    6
+         chave:  a    b    a    c    a    b    d
+                 v1   v1   v2   v1   v3   tomb v1
+
+depois   offset: 3    4    5    6
+         chave:  c    a    b    d
+                 v1   v3   tomb v1
+```
+
+Duas decisoes moldam esse resultado, e as duas mudam garantias:
+
+**Os offsets nao sao renumerados.** O offset e a unica coordenada estavel que o
+braunlog oferece; quem guardou "ja li ate o 8.412" guardou um endereco. Renumerar
+transformaria esse endereco em outro registro, em silencio, sem erro em lugar
+nenhum. Entao o segmento compactado fica com **lacunas** — e a garantia "offset
+sem lacuna" vale ate a primeira compactacao. Depois dela os offsets continuam
+monotonicos e unicos, com buracos que dizem "algo aqui foi substituido".
+
+**O tombstone e preservado.** Apagar a marca de delecao liberaria mais espaco e
+faria o log mentir para quem le devagar: um consumidor no offset 100 nunca veria
+a delecao que estava no 500, e continuaria achando que a chave tem o valor antigo.
+O Kafka resolve isso com `delete.retention.ms`; aqui o tombstone fica para sempre,
+e o custo — 30 e poucos bytes por chave deletada, para sempre — esta na lista de
+limitacoes. Ver [ADR 0009](docs/adr/0009-compactacao-preserva-offset-e-tombstone.md).
+
+Registros **sem chave** sobrevivem sempre: nao ha como serem substituidos.
+
+### Dirty ratio: quando compensa reescrever
+
+Compactar um segmento custa ler e escrever o segmento inteiro. Se so 5% dos bytes
+estao obsoletos, esse custo compra 5% de espaco. `dirtyRatioMinimo` (0,5 por
+padrao) e o botao que decide: um segmento so e reescrito quando pelo menos metade
+dos bytes dele ja foi substituida. Dados que quase nao mudam ficam intocados.
+
+A troca e atomica e leitores em andamento sobrevivem a ela — o `move` troca a
+entrada de diretorio, o arquivo antigo continua vivo enquanto houver descritor
+aberto, e o leitor se reposiciona pelo proximo offset que esperava.
+
 ## Garantias e nao-garantias
 
 Nenhuma linha desta tabela esta aqui sem um teste que a prove.
@@ -206,7 +281,12 @@ Nenhuma linha desta tabela esta aqui sem um teste que a prove.
 | Corrupcao anterior ao ponto de varredura e detectada **na leitura**, nao na abertura | sempre | [`RecuperacaoTest#deveDetectarNaLeituraACorrupcaoQueAAberturaNaoVarreu`](braunlog-core/src/test/java/com/braunlog/RecuperacaoTest.java) |
 | Escrita parcial nao e lida como valida | sempre | [`RecuperacaoTest#deveRecuperarTruncandoRegistroParcialEmQualquerPosicaoDeCorte`](braunlog-core/src/test/java/com/braunlog/RecuperacaoTest.java) e [`RecuperacaoComSegmentosTest#deveTruncarCaudaParcialDoUltimoSegmentoEmQualquerPosicaoDeCorte`](braunlog-core/src/test/java/com/braunlog/RecuperacaoComSegmentosTest.java) — **toda** posicao de corte |
 | Depois da recuperacao da para continuar escrevendo | sempre | os dois testes acima anexam e conferem o offset resultante |
-| Offset e monotonico e sem lacuna | sempre | [`SegmentacaoTest#deveManterOffsetContinuoESemLacunaEntreSegmentos`](braunlog-core/src/test/java/com/braunlog/SegmentacaoTest.java), verificado tambem em todo teste de recuperacao |
+| Offset e monotonico, unico e crescente | sempre | [`SegmentacaoTest#deveManterOffsetContinuoESemLacunaEntreSegmentos`](braunlog-core/src/test/java/com/braunlog/SegmentacaoTest.java), verificado tambem em todo teste de recuperacao |
+| Offset **sem lacuna** | ate a primeira compactacao | depois de compactar os offsets ficam com buracos, de proposito: [`CompactacaoTest#devePreservarOsOffsetsOriginaisDeixandoLacunas`](braunlog-core/src/test/java/com/braunlog/CompactacaoTest.java) |
+| Compactacao preserva o ultimo valor de cada chave | sempre | [`CompactacaoPropriedadesTest#compactacaoDevePreservarOUltimoValorDeCadaChave`](braunlog-core/src/test/java/com/braunlog/CompactacaoPropriedadesTest.java) — comparado contra um `HashMap` com put e delete aleatorios |
+| Compactacao e idempotente e sobrevive a reabertura | sempre | [`CompactacaoPropriedadesTest#compactarDuasVezesSeguidasNaoDeveMudarNada`](braunlog-core/src/test/java/com/braunlog/CompactacaoPropriedadesTest.java) e [`#compactacaoDeveSobreviverAReabertura`](braunlog-core/src/test/java/com/braunlog/CompactacaoPropriedadesTest.java) |
+| Leitor em andamento sobrevive a troca do segmento compactado | sempre | [`CompactacaoTest#leitorEmAndamentoDeveSobreviverATrocaDoSegmento`](braunlog-core/src/test/java/com/braunlog/CompactacaoTest.java) |
+| Retencao apaga segmento inteiro e nunca o ativo | sempre | [`RetencaoTest#nuncaDeveApagarOSegmentoAtivoMesmoQueAPoliticaMande`](braunlog-core/src/test/java/com/braunlog/RetencaoTest.java) |
 | Registro confirmado sobrevive a queda do **processo** | nos tres modos | [`QuedaDeProcessoTest#registroConfirmadoDeveSobreviverAoKillDoProcessoEmQualquerModo`](braunlog-core/src/test/java/com/braunlog/QuedaDeProcessoTest.java) — `SIGKILL` numa JVM filha de verdade |
 | Registro confirmado sobrevive a queda do **sistema operacional** | apenas modo `ACadaAppend` | **declarado, nao provado** — nao ha como derrubar o sistema operacional de dentro de um teste. O que e provado e que o modo chama `fsync` uma vez por registro: [`DurabilidadeTest#modoACadaAppendDeveSincronizarUmaVezPorRegistro`](braunlog-core/src/test/java/com/braunlog/DurabilidadeTest.java) |
 | Registro confirmado **pode ser perdido** numa queda do sistema operacional | modos `PorIntervalo` e `Nenhum` | [`DurabilidadeTest#modoNenhumNuncaDeveSincronizarSozinho`](braunlog-core/src/test/java/com/braunlog/DurabilidadeTest.java) e [`#modoPorIntervaloNaoDeveSincronizarSozinhoComOLogOcioso`](braunlog-core/src/test/java/com/braunlog/DurabilidadeTest.java) mostram que o `fsync` nao acontece |
@@ -224,6 +304,13 @@ Nenhuma linha desta tabela esta aqui sem um teste que a prove.
   naquele intervalo ([ADR 0005](docs/adr/0005-timestamp-nao-decrescente.md)).
 - Um unico writer. `anexar` e `synchronized`, entao chamar de varias threads e
   seguro, mas nao e mais rapido.
+- Depois de compactar, offsets tem lacunas. Quem depender de "offset + 1 e o
+  proximo registro" quebra ([ADR 0009](docs/adr/0009-compactacao-preserva-offset-e-tombstone.md)).
+- Um tombstone nunca e removido, entao chave deletada deixa ~30 bytes para sempre.
+- A retencao pode apagar o segmento que um leitor esta lendo; ele salta para o
+  proximo segmento vivo, sem erro e sem os registros que sumiram.
+- Compactar carrega em memoria um mapa de todas as chaves distintas dos segmentos
+  fechados. Nenhum valor entra em memoria, mas o numero de chaves importa.
 
 ## Estado do projeto
 
@@ -232,8 +319,8 @@ Nenhuma linha desta tabela esta aqui sem um teste que a prove.
 | 1 | formato do registro, append e leitura num arquivo, recuperacao basica | pronta |
 | 2 | segmentos, rolagem, indice esparso, busca por tempo, benchmark inicial | pronta |
 | 3 | modos de durabilidade, recuperacao completa, concurrency | pronta |
-| 4 | retencao e compactacao por chave | proxima |
-| 5 | suite JMH completa e acabamento | |
+| 4 | retencao e compactacao por chave | pronta |
+| 5 | suite JMH completa e acabamento | proxima |
 
 ## Como rodar
 
