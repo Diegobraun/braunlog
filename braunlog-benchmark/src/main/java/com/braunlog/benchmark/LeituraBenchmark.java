@@ -37,7 +37,7 @@ import com.braunlog.Registro;
 @Measurement(iterations = 3, time = 1)
 public class LeituraBenchmark {
 
-  @Param({"4096", "65536"})
+  @Param({"1024", "4096", "65536", "1048576"})
   public int intervaloDoIndiceEmBytes;
 
   private DiretorioTemporario diretorio;
@@ -49,7 +49,7 @@ public class LeituraBenchmark {
     ConfiguracaoLog configuracao =
         Referencia.configuracao().comIntervaloDoIndiceEmBytes(intervaloDoIndiceEmBytes);
     log = Log.abrir(diretorio.caminho(), configuracao);
-    byte[] valor = new byte[Referencia.BYTES_DO_VALOR_NA_LEITURA];
+    byte[] valor = new byte[Referencia.BYTES_DO_VALOR];
     for (int i = 0; i < Referencia.REGISTROS_PARA_LEITURA; i++) {
       log.anexar(Registro.de(("chave-" + i).getBytes(), valor));
     }

@@ -8,7 +8,7 @@ import com.braunlog.ConfiguracaoLog;
 final class Referencia {
 
   static final int REGISTROS_PARA_LEITURA = 100_000;
-  static final int BYTES_DO_VALOR_NA_LEITURA = 256;
+  static final int BYTES_DO_VALOR = 256;
 
   private Referencia() {}
 
